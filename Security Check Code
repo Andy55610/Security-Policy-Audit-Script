@@ -1,0 +1,81 @@
+import subprocess
+import re
+import os
+
+def run_command(cmd):
+    """Run a system command and return its output."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+        return result.stdout.strip()
+    except Exception as e:
+        return f"Error running command: {e}"
+
+def check_guest_account():
+    output = run_command("net user guest")
+    if "Account active               No" in output:
+        return "[PASS] Guest account is disabled"
+    else:
+        return "[FAIL] Guest account is enabled"
+
+def check_password_complexity():
+    output = run_command("net accounts")
+    if "Password complexity requirements:  Enabled" in output:
+        return "[PASS] Password complexity is enabled"
+    else:
+        return "[FAIL] Password complexity is not enabled"
+
+def check_min_password_length():
+    output = run_command("net accounts")
+    match = re.search(r"Minimum password length:\s+(\d+)", output)
+    if match and int(match.group(1)) >= 8:
+        return f"[PASS] Minimum password length is {match.group(1)} (secure)"
+    elif match:
+        return f"[FAIL] Minimum password length is {match.group(1)} (too short)"
+    else:
+        return "[WARN] Could not determine password length policy"
+
+def check_windows_update_service():
+    output = run_command('sc query wuauserv')
+    if "RUNNING" in output:
+        return "[PASS] Windows Update service is running"
+    else:
+        return "[FAIL] Windows Update service is stopped"
+
+def check_firewall_status():
+    output = run_command("netsh advfirewall show allprofiles")
+    if all("State ON" in line for line in output.splitlines() if "State" in line):
+        return "[PASS] Firewall is enabled for all profiles"
+    else:
+        return "[FAIL] Firewall is not fully enabled"
+
+def check_remote_desktop():
+    output = run_command('reg query "HKLM\\System\\CurrentControlSet\\Control\\Terminal Server" /v fDenyTSConnections')
+    if "0x1" in output:
+        return "[PASS] Remote Desktop is disabled"
+    else:
+        return "[FAIL] Remote Desktop is enabled"
+
+def check_antivirus_status():
+    output = run_command("powershell Get-MpComputerStatus | findstr AMServiceEnabled")
+    if "True" in output:
+        return "[PASS] Windows Defender real-time protection is enabled"
+    else:
+        return "[FAIL] Windows Defender is disabled or missing"
+
+def run_audit():
+    print("Windows Security Audit Report")
+    print("-" * 40)
+    checks = [
+        check_guest_account,
+        check_password_complexity,
+        check_min_password_length,
+        check_windows_update_service,
+        check_firewall_status,
+        check_remote_desktop,
+        check_antivirus_status
+    ]
+    for check in checks:
+        print(check())
+
+if __name__ == "__main__":
+    run_audit()
