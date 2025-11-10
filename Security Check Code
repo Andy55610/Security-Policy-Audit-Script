@@ -1,81 +1,102 @@
-import subprocess
-import re
-import os
+#!/usr/bin/env python3
+"""
+CIS Benchmark Compliance Checker
+Author: Andy Sardinas
+Description:
+    Checks basic CIS compliance rules on a Linux system.
+    This script reports status for password policy, SSH configuration,
+    and important file permissions.
+"""
 
-def run_command(cmd):
-    """Run a system command and return its output."""
+import os
+import re
+import subprocess
+
+# Utility function
+def run_command(command: str) -> str:
+    """Run a shell command safely and return its output."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+        result = subprocess.run(command, shell=True, text=True, capture_output=True)
         return result.stdout.strip()
     except Exception as e:
-        return f"Error running command: {e}"
+        return f"Error executing {command}: {e}"
 
-def check_guest_account():
-    output = run_command("net user guest")
-    if "Account active               No" in output:
-        return "[PASS] Guest account is disabled"
-    else:
-        return "[FAIL] Guest account is enabled"
+def check_password_policy():
+    """CIS Rule: Ensure password aging and complexity are enforced."""
+    print("\n[1] Checking password policy (CIS 5.4.1.x)...")
 
-def check_password_complexity():
-    output = run_command("net accounts")
-    if "Password complexity requirements:  Enabled" in output:
-        return "[PASS] Password complexity is enabled"
-    else:
-        return "[FAIL] Password complexity is not enabled"
+    policy = run_command("grep -E 'PASS_MAX_DAYS|PASS_MIN_DAYS|PASS_WARN_AGE' /etc/login.defs")
+    print(policy if policy else "No password policy found in /etc/login.defs")
 
-def check_min_password_length():
-    output = run_command("net accounts")
-    match = re.search(r"Minimum password length:\s+(\d+)", output)
-    if match and int(match.group(1)) >= 8:
-        return f"[PASS] Minimum password length is {match.group(1)} (secure)"
-    elif match:
-        return f"[FAIL] Minimum password length is {match.group(1)} (too short)"
+    if "PASS_MAX_DAYS" in policy and int(re.search(r'PASS_MAX_DAYS\s+(\d+)', policy).group(1)) <= 365:
+        print("✅ PASS_MAX_DAYS within CIS recommended range")
     else:
-        return "[WARN] Could not determine password length policy"
+        print("❌ PASS_MAX_DAYS not set or too long")
 
-def check_windows_update_service():
-    output = run_command('sc query wuauserv')
-    if "RUNNING" in output:
-        return "[PASS] Windows Update service is running"
-    else:
-        return "[FAIL] Windows Update service is stopped"
+def check_ssh_config():
+    """CIS Rule: Ensure SSH settings are secure."""
+    print("\n[2] Checking SSH configuration (CIS 5.2.x)...")
+
+    sshd_config = "/etc/ssh/sshd_config"
+    if not os.path.exists(sshd_config):
+        print("❌ SSH config not found")
+        return
+
+    content = run_command(f"cat {sshd_config}")
+    checks = {
+        "PermitRootLogin": "no",
+        "Protocol": "2",
+        "X11Forwarding": "no",
+        "MaxAuthTries": "4",
+    }
+
+    for key, expected in checks.items():
+        match = re.search(rf'^{key}\s+(\S+)', content, re.MULTILINE)
+        if match and match.group(1).lower() == expected:
+            print(f"✅ {key} = {expected}")
+        else:
+            print(f"❌ {key} not set correctly (expected {expected})")
+
+def check_file_permissions():
+    """CIS Rule: Ensure important files have secure permissions."""
+    print("\n[3] Checking critical file permissions (CIS 6.1.x)...")
+
+    files = {
+        "/etc/passwd": "644",
+        "/etc/shadow": "640",
+        "/etc/group": "644",
+    }
+
+    for file, expected_perm in files.items():
+        if not os.path.exists(file):
+            print(f"❌ {file} not found")
+            continue
+
+        actual_perm = oct(os.stat(file).st_mode & 0o777)[2:]
+        if actual_perm == expected_perm:
+            print(f"✅ {file} permissions = {expected_perm}")
+        else:
+            print(f"❌ {file} permissions = {actual_perm} (expected {expected_perm})")
 
 def check_firewall_status():
-    output = run_command("netsh advfirewall show allprofiles")
-    if all("State ON" in line for line in output.splitlines() if "State" in line):
-        return "[PASS] Firewall is enabled for all profiles"
-    else:
-        return "[FAIL] Firewall is not fully enabled"
+    """CIS Rule: Ensure firewall is enabled."""
+    print("\n[4] Checking firewall status (CIS 3.5.x)...")
 
-def check_remote_desktop():
-    output = run_command('reg query "HKLM\\System\\CurrentControlSet\\Control\\Terminal Server" /v fDenyTSConnections')
-    if "0x1" in output:
-        return "[PASS] Remote Desktop is disabled"
-    else:
-        return "[FAIL] Remote Desktop is enabled"
+    ufw_status = run_command("ufw status 2>/dev/null")
+    firewalld_status = run_command("systemctl is-active firewalld 2>/dev/null")
 
-def check_antivirus_status():
-    output = run_command("powershell Get-MpComputerStatus | findstr AMServiceEnabled")
-    if "True" in output:
-        return "[PASS] Windows Defender real-time protection is enabled"
+    if "active" in ufw_status.lower() or "active" in firewalld_status.lower():
+        print("✅ Firewall is active")
     else:
-        return "[FAIL] Windows Defender is disabled or missing"
+        print("❌ No active firewall detected")
 
-def run_audit():
-    print("Windows Security Audit Report")
-    print("-" * 40)
-    checks = [
-        check_guest_account,
-        check_password_complexity,
-        check_min_password_length,
-        check_windows_update_service,
-        check_firewall_status,
-        check_remote_desktop,
-        check_antivirus_status
-    ]
-    for check in checks:
-        print(check())
+def main():
+    print("=== CIS Compliance Checker ===")
+    check_password_policy()
+    check_ssh_config()
+    check_file_permissions()
+    check_firewall_status()
+    print("\nCompliance check complete.")
 
 if __name__ == "__main__":
-    run_audit()
+    main()
