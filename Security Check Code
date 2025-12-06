@@ -1,102 +1,313 @@
-#!/usr/bin/env python3
-"""
-CIS Benchmark Compliance Checker
-Author: Andy Sardinas
-Description:
-    Checks basic CIS compliance rules on a Linux system.
-    This script reports status for password policy, SSH configuration,
-    and important file permissions.
-"""
+<#
+.SYNOPSIS
+  Windows security audit: password max days, SSH config, critical file permissions, firewall status.
 
-import os
-import re
-import subprocess
+.USAGE
+  Run PowerShell as Administrator:
+    powershell -ExecutionPolicy Bypass -File .\win_security_audit.ps1
 
-# Utility function
-def run_command(command: str) -> str:
-    """Run a shell command safely and return its output."""
-    try:
-        result = subprocess.run(command, shell=True, text=True, capture_output=True)
-        return result.stdout.strip()
-    except Exception as e:
-        return f"Error executing {command}: {e}"
+.NOTES
+  - The script tries to use AD cmdlets if available (Get-ADDefaultDomainPasswordPolicy).
+  - If run without Administrator privileges, some checks (file ACLs, SAM) may fail or be partial.
+#>
 
-def check_password_policy():
-    """CIS Rule: Ensure password aging and complexity are enforced."""
-    print("\n[1] Checking password policy (CIS 5.4.1.x)...")
+#region Helper functions
+function Write-Section($title) {
+    Write-Host "========================================" -ForegroundColor DarkCyan
+    Write-Host $title -ForegroundColor Cyan
+    Write-Host "----------------------------------------" -ForegroundColor DarkCyan
+}
 
-    policy = run_command("grep -E 'PASS_MAX_DAYS|PASS_MIN_DAYS|PASS_WARN_AGE' /etc/login.defs")
-    print(policy if policy else "No password policy found in /etc/login.defs")
+function Safe-GetContent($path) {
+    if (Test-Path $path) {
+        try { Get-Content -Path $path -ErrorAction Stop } catch { return $null }
+    } else { return $null }
+}
 
-    if "PASS_MAX_DAYS" in policy and int(re.search(r'PASS_MAX_DAYS\s+(\d+)', policy).group(1)) <= 365:
-        print("✅ PASS_MAX_DAYS within CIS recommended range")
-    else:
-        print("❌ PASS_MAX_DAYS not set or too long")
+function Get-JsonOutputPath {
+    Join-Path -Path (Get-Location) -ChildPath "security-audit-report.json"
+}
+#endregion
 
-def check_ssh_config():
-    """CIS Rule: Ensure SSH settings are secure."""
-    print("\n[2] Checking SSH configuration (CIS 5.2.x)...")
+#region Password policy: max password age
+Write-Section "Password Policy — Maximum Password Age"
 
-    sshd_config = "/etc/ssh/sshd_config"
-    if not os.path.exists(sshd_config):
-        print("❌ SSH config not found")
-        return
+$pwResult = @{
+    Source = $null
+    MaximumPasswordAgeDays = $null
+    Raw = $null
+    Notes = @()
+}
 
-    content = run_command(f"cat {sshd_config}")
-    checks = {
-        "PermitRootLogin": "no",
-        "Protocol": "2",
-        "X11Forwarding": "no",
-        "MaxAuthTries": "4",
+# Try Active Directory domain policy first (if AD module available)
+try {
+    if (Get-Module -ListAvailable -Name ActiveDirectory) {
+        Import-Module ActiveDirectory -ErrorAction Stop
+        $domainPolicy = Get-ADDefaultDomainPasswordPolicy -ErrorAction Stop
+        if ($domainPolicy -and $domainPolicy.MaxPasswordAge) {
+            $pwResult.Source = "ActiveDirectoryDomainPolicy"
+            # MaxPasswordAge is a timespan
+            $pwResult.MaximumPasswordAgeDays = [math]::Round($domainPolicy.MaxPasswordAge.TotalDays,2)
+            $pwResult.Raw = $domainPolicy | Select-Object *
+        }
+    }
+} catch {
+    $pwResult.Notes += "AD module present but could not query domain policy: $($_.Exception.Message)"
+}
+
+# Fallback to local policy via 'net accounts' if not found above
+if (-not $pwResult.MaximumPasswordAgeDays) {
+    try {
+        $netOut = net accounts 2>$null
+        if ($LASTEXITCODE -eq 0 -or $netOut) {
+            $pwResult.Source = "LocalPolicy-netAccounts"
+            $pwResult.Raw = $netOut
+            # net accounts contains line like "Maximum password age (days): 42"
+            $line = $netOut | Where-Object { $_ -match "Maximum password age" } | Select-Object -First 1
+            if ($line) {
+                if ($line -match ":\s*([0-9]+)") {
+                    $pwResult.MaximumPasswordAgeDays = [int]$matches[1]
+                } elseif ($line -match "never") {
+                    $pwResult.MaximumPasswordAgeDays = "Never"
+                }
+            } else {
+                # Try secedit export (local security policy)
+                $pwResult.Notes += "Could not parse 'net accounts' output for max age."
+            }
+        }
+    } catch {
+        $pwResult.Notes += "Error running 'net accounts': $($_.Exception.Message)"
+    }
+}
+
+if (-not $pwResult.MaximumPasswordAgeDays) {
+    $pwResult.Notes += "Maximum password age not determined. Consider running as domain/admin or ensuring Local Security Policy is accessible."
+}
+
+# Print
+if ($pwResult.MaximumPasswordAgeDays) {
+    Write-Host "Source: $($pwResult.Source)"
+    Write-Host "Maximum password age (days): $($pwResult.MaximumPasswordAgeDays)" -ForegroundColor Green
+} else {
+    Write-Host "Maximum password age: NOT DETERMINED" -ForegroundColor Yellow
+    $pwResult.Notes | ForEach-Object { Write-Host ("Note: $_") -ForegroundColor DarkYellow }
+}
+#endregion
+
+#region SSH (OpenSSH) config check
+Write-Section "OpenSSH (sshd) Configuration Check"
+
+# Common Windows OpenSSH locations
+$sshPaths = @(
+    "$env:ProgramData\ssh\sshd_config",
+    "C:\Windows\System32\OpenSSH\sshd_config",
+    "C:\Program Files\OpenSSH\sshd_config"
+)
+
+$sshResult = @{
+    Found = $false
+    Path = $null
+    Parsed = @{}
+    Raw = $null
+    Notes = @()
+}
+
+foreach ($p in $sshPaths) {
+    if (Test-Path $p) {
+        $sshResult.Found = $true
+        $sshResult.Path = $p
+        $sshContent = Safe-GetContent $p
+        $sshResult.Raw = $sshContent
+        # parse common parameters of interest
+        $params = @{
+            "Port" = $null
+            "PermitRootLogin" = $null
+            "PasswordAuthentication" = $null
+            "PubkeyAuthentication" = $null
+            "PermitEmptyPasswords" = $null
+            "AllowUsers" = $null
+        }
+        foreach ($k in $params.Keys) {
+            $match = $sshContent | Where-Object { $_ -match "^\s*#?\s*$k\s+" } | Select-Object -First 1
+            if ($match) {
+                # extract value
+                if ($match -match "^\s*#?\s*$k\s+(.+)$") {
+                    $params[$k] = $matches[1].Trim()
+                }
+            }
+        }
+        $sshResult.Parsed = $params
+        break
+    }
+}
+
+if ($sshResult.Found) {
+    Write-Host "sshd_config found at: $($sshResult.Path)" -ForegroundColor Green
+    Write-Host "Parsed key settings:"
+    $sshResult.Parsed.GetEnumerator() | ForEach-Object {
+        $k = $_.Key; $v = $_.Value
+        if (-not $v) { $v = "<not set / default>" }
+        Write-Host ("  {0,-22} : {1}" -f $k, $v)
+    }
+} else {
+    Write-Host "No OpenSSH sshd_config found in common locations." -ForegroundColor Yellow
+    $sshResult.Notes += "sshd_config not found in $($sshPaths -join ', ')"
+}
+
+#endregion
+
+#region Critical file permissions check
+Write-Section "Critical File Permissions Check"
+
+# Files to check: modify this list to include other critical files you care about.
+$criticalFiles = @(
+    "C:\Windows\System32\config\SAM",
+    "C:\Windows\System32\drivers\etc\hosts",
+    "C:\Windows\System32\config\SECURITY",
+    "C:\Windows\System32\GroupPolicy\Registry.pol",  # may not exist
+    "C:\Windows\System32\config\SOFTWARE"
+)
+
+$fileResults = @()
+
+foreach ($f in $criticalFiles) {
+    $entry = @{
+        Path = $f
+        Exists = $false
+        Owner = $null
+        InsecureAces = @()
+        FullAcl = $null
+        Notes = @()
     }
 
-    for key, expected in checks.items():
-        match = re.search(rf'^{key}\s+(\S+)', content, re.MULTILINE)
-        if match and match.group(1).lower() == expected:
-            print(f"✅ {key} = {expected}")
-        else:
-            print(f"❌ {key} not set correctly (expected {expected})")
-
-def check_file_permissions():
-    """CIS Rule: Ensure important files have secure permissions."""
-    print("\n[3] Checking critical file permissions (CIS 6.1.x)...")
-
-    files = {
-        "/etc/passwd": "644",
-        "/etc/shadow": "640",
-        "/etc/group": "644",
+    if (Test-Path $f) {
+        $entry.Exists = $true
+        try {
+            $acl = Get-Acl -Path $f -ErrorAction Stop
+            $entry.Owner = $acl.Owner
+            # Convert Access rules to readable
+            $aces = @()
+            foreach ($ace in $acl.Access) {
+                $aces += @{
+                    Identity = $ace.IdentityReference.Value
+                    FileSystemRights = $ace.FileSystemRights.ToString()
+                    AccessControlType = $ace.AccessControlType.ToString()
+                    IsInherited = $ace.IsInherited
+                }
+                # Flag risky ACEs: Everyone or Authenticated Users with Write/Modify/FullControl
+                if ($ace.IdentityReference -match "Everyone|Authenticated Users|Users" -and ($ace.FileSystemRights.ToString() -match "Write|Modify|FullControl")) {
+                    $entry.InsecureAces += @{
+                        Identity = $ace.IdentityReference.Value
+                        Rights = $ace.FileSystemRights.ToString()
+                        Type = $ace.AccessControlType.ToString()
+                    }
+                }
+            }
+            $entry.FullAcl = $aces
+            if ($entry.InsecureAces.Count -gt 0) {
+                $entry.Notes += "Found overly permissive ACEs for common principals (Everyone/Users...)."
+            }
+        } catch {
+            $entry.Notes += "Error reading ACL: $($_.Exception.Message)"
+        }
+    } else {
+        $entry.Notes += "File not found."
     }
+    $fileResults += [PSCustomObject]$entry
+}
 
-    for file, expected_perm in files.items():
-        if not os.path.exists(file):
-            print(f"❌ {file} not found")
-            continue
+# Print summary
+foreach ($r in $fileResults) {
+    Write-Host "File: $($r.Path)" -ForegroundColor White
+    if (-not $r.Exists) {
+        Write-Host "  -> NOT FOUND" -ForegroundColor Yellow
+        $r.Notes | ForEach-Object { Write-Host "     Note: $_" -ForegroundColor DarkYellow }
+        continue
+    }
+    Write-Host "  Owner: $($r.Owner)"
+    if ($r.InsecureAces.Count -gt 0) {
+        Write-Host "  Insecure ACL entries detected:" -ForegroundColor Red
+        $r.InsecureAces | ForEach-Object {
+            Write-Host ("    - {0} : {1} ({2})" -f $_.Identity, $_.Rights, $_.Type) -ForegroundColor Red
+        }
+    } else {
+        Write-Host "  No obvious insecure ACEs for Everyone/Users/Authenticated Users." -ForegroundColor Green
+    }
+    $r.Notes | ForEach-Object { Write-Host "  Note: $_" -ForegroundColor DarkYellow }
+}
+#endregion
 
-        actual_perm = oct(os.stat(file).st_mode & 0o777)[2:]
-        if actual_perm == expected_perm:
-            print(f"✅ {file} permissions = {expected_perm}")
-        else:
-            print(f"❌ {file} permissions = {actual_perm} (expected {expected_perm})")
+#region Firewall status and service check
+Write-Section "Windows Firewall Status"
 
-def check_firewall_status():
-    """CIS Rule: Ensure firewall is enabled."""
-    print("\n[4] Checking firewall status (CIS 3.5.x)...")
+$fwResult = @{
+    Profiles = @()
+    ServiceStatus = $null
+    Notes = @()
+}
 
-    ufw_status = run_command("ufw status 2>/dev/null")
-    firewalld_status = run_command("systemctl is-active firewalld 2>/dev/null")
+try {
+    $profiles = Get-NetFirewallProfile -ErrorAction Stop
+    foreach ($p in $profiles) {
+        $fwResult.Profiles += @{
+            Name = $p.Name
+            Enabled = $p.Enabled
+            DefaultInboundAction = $p.DefaultInboundAction.ToString()
+            DefaultOutboundAction = $p.DefaultOutboundAction.ToString()
+            AllowLocalPolicyMerge = $p.AllowLocalPolicyMerge
+        }
+    }
+} catch {
+    $fwResult.Notes += "Could not query firewall profiles with Get-NetFirewallProfile: $($_.Exception.Message)"
+}
 
-    if "active" in ufw_status.lower() or "active" in firewalld_status.lower():
-        print("✅ Firewall is active")
-    else:
-        print("❌ No active firewall detected")
+# Check firewall service (MpsSvc)
+try {
+    $svc = Get-Service -Name MpsSvc -ErrorAction Stop
+    $fwResult.ServiceStatus = @{
+        Status = $svc.Status
+        StartType = (Get-CimInstance -ClassName Win32_Service -Filter "Name='MpsSvc'").StartMode
+    }
+} catch {
+    $fwResult.Notes += "Could not query MpsSvc: $($_.Exception.Message)"
+}
 
-def main():
-    print("=== CIS Compliance Checker ===")
-    check_password_policy()
-    check_ssh_config()
-    check_file_permissions()
-    check_firewall_status()
-    print("\nCompliance check complete.")
+# Print
+if ($fwResult.Profiles.Count -gt 0) {
+    foreach ($p in $fwResult.Profiles) {
+        Write-Host ("Profile: {0,-10} Enabled: {1,-5} Inbound: {2,-10} Outbound: {3,-10}" -f $p.Name, $p.Enabled, $p.DefaultInboundAction, $p.DefaultOutboundAction)
+    }
+} else {
+    Write-Host "Firewall profiles not available." -ForegroundColor Yellow
+}
+if ($fwResult.ServiceStatus) {
+    Write-Host ("Firewall service (MpsSvc) status: {0} (start mode: {1})" -f $fwResult.ServiceStatus.Status, $fwResult.ServiceStatus.StartType)
+} else {
+    Write-Host "Firewall service status not available." -ForegroundColor Yellow
+}
+$fwResult.Notes | ForEach-Object { Write-Host ("Note: $_") -ForegroundColor DarkYellow }
+#endregion
 
-if __name__ == "__main__":
-    main()
+#region Compose JSON report and save
+$report = @{
+    Timestamp = (Get-Date).ToString("o")
+    Computer = $env:COMPUTERNAME
+    User = (whoami)
+    PasswordPolicy = $pwResult
+    SSH = $sshResult
+    CriticalFiles = $fileResults
+    Firewall = $fwResult
+}
+
+$reportPath = Get-JsonOutputPath
+try {
+    $report | ConvertTo-Json -Depth 6 | Out-File -FilePath $reportPath -Encoding UTF8
+    Write-Host "JSON report written to: $reportPath" -ForegroundColor Green
+} catch {
+    Write-Host "Failed to write JSON report: $($_.Exception.Message)" -ForegroundColor Red
+}
+#endregion
+
+Write-Host ""
+Write-Host "Audit complete." -ForegroundColor Cyan
+Write-Host "If you need additional checks (e.g., local account age, more files, registry checks), tell me what to add." -ForegroundColor Gray
